@@ -1,0 +1,162 @@
+"""Client for the RAID competition system: fetch challenges, submit solutions, check results."""
+import json
+import os
+import posixpath
+import re
+import shutil
+import tarfile
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+__all__ = ["Raid", "RaidError"]
+__version__ = "0.1.0"
+
+DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
+PARTS = ("source", "data", "scoring")
+SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+class RaidError(Exception):
+    pass
+
+
+class Raid:
+    """raid = Raid(api_key); print(raid.howto())"""
+
+    def __init__(self, api_key, url=None, path="."):
+        self.api_key = api_key.strip()
+        self.url = (url or os.environ.get("RAID_URL") or DEFAULT_URL).rstrip("/")
+        self.path = Path(path)
+
+    def howto(self):
+        """Explain the workflow."""
+        return self._json("/api/howto")["text"]
+
+    def fetch(self, challenge, force=False):
+        """Download source/, data/ and scoring/ of a challenge into ./<challenge>/.
+
+        An existing directory is left untouched unless force=True, which overwrites the challenge files.
+        """
+        target = self.path / _check(challenge)
+        if target.exists() and not force:
+            print(f"{target}/ already exists. Use raid.fetch({challenge!r}, force=True) to download it again "
+                  "(this overwrites the challenge files).")
+            return target
+        with tempfile.TemporaryDirectory() as tmp:
+            for part in PARTS:
+                with self._request("GET", f"/api/challenges/{challenge}/{part}.tar.gz", timeout=300) as r, \
+                        open(Path(tmp) / f"{part}.tar.gz", "wb") as f:
+                    shutil.copyfileobj(r, f, 1 << 20)
+            target.mkdir(parents=True, exist_ok=True)
+            for part in PARTS:
+                _extract(Path(tmp) / f"{part}.tar.gz", target, part)
+        print(f"Fetched {challenge} into {target}/. Start with {target / 'source' / 'README.txt'}.")
+        return target
+
+    def submit(self, challenge):
+        """Pack ./<challenge>/source/ and submit it for scoring. Returns the submission id."""
+        source = self.path / _check(challenge) / "source"
+        if not source.is_dir():
+            raise RaidError(f"{source}/ not found. Run raid.fetch({challenge!r}) first.")
+        required = self._json(f"/api/challenges/{challenge}")["required_files"]
+        missing = [f for f in required if not (source / f).is_file()]
+        if missing:
+            raise RaidError(f"Missing required files in {source}/: " + ", ".join(missing))
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "source.tar.gz"
+            _pack(source, archive)
+            size = archive.stat().st_size
+            with open(archive, "rb") as f, self._request(
+                    "POST", f"/api/submit/{challenge}", data=f, timeout=900,
+                    headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
+                result = json.load(r)
+        print(f"Submitted {challenge} ({size / 1e6:.2f} MB) as submission {result['id']}. "
+              f"Check it with raid.status({challenge!r}).")
+        return result["id"]
+
+    def status(self, challenge=None):
+        """Print your submissions (newest first) and return them as a list of dicts."""
+        query = f"?challenge={_check(challenge)}" if challenge else ""
+        subs = self._json(f"/api/submissions{query}")["submissions"]
+        print(f"{'ID':>6}  {'CHALLENGE':<20} {'STATUS':<8} {'SCORE':>10}  SUBMITTED")
+        for s in subs:
+            score = "" if s["score"] is None else f"{s['score']:.4f}"
+            print(f"{s['id']:>6}  {s['challenge']:<20} {s['status']:<8} {score:>10}  {s['submitted_at'][:19]}")
+        if not subs:
+            print("No submissions yet.")
+        return subs
+
+    def log(self, submission_id):
+        """Return the scoring log of one of your submissions."""
+        return self._json(f"/api/submissions/{int(submission_id)}")["log"]
+
+    def _request(self, method, endpoint, data=None, headers=None, timeout=60):
+        req = urllib.request.Request(self.url + endpoint, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.api_key}", "User-Agent": f"raid/{__version__}", **(headers or {})})
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                message = json.load(e).get("error")
+            except (ValueError, AttributeError):
+                message = None
+            raise RaidError(message or f"{e.code} {e.reason}") from None
+        except urllib.error.URLError as e:
+            raise RaidError(f"Cannot reach {self.url}: {e.reason}") from None
+
+    def _json(self, endpoint):
+        with self._request("GET", endpoint) as r:
+            return json.load(r)
+
+
+def _check(challenge):
+    if not isinstance(challenge, str) or not NAME_RE.match(challenge):
+        raise RaidError(f"Invalid challenge name {challenge!r}.")
+    return challenge
+
+
+def _extract(archive, target, part):
+    """Extract only regular files and directories below part/, never outside target."""
+    root = target.resolve()
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar:
+            name = posixpath.normpath(member.name)
+            if name != part and not name.startswith(part + "/"):
+                raise RaidError(f"Unexpected entry {member.name!r} in the {part} archive.")
+            dest = (root / name).resolve()
+            if root not in dest.parents:
+                raise RaidError(f"Unsafe entry {member.name!r} in the {part} archive.")
+            if member.isdir():
+                dest.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(member) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                if member.mode & 0o111:
+                    dest.chmod(0o755)
+
+
+def _normalize(info):
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mode = 0o755 if info.isdir() or info.mode & 0o111 else 0o644
+    return info
+
+
+def _pack(source, archive):
+    """tar.gz of source/ with regular files only; caches, VCS data and symlinks are left out."""
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(source, arcname="source", recursive=False, filter=_normalize)
+        for dirpath, dirnames, filenames in os.walk(source):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP)
+            rel = Path(dirpath).relative_to(source)
+            for name in dirnames + sorted(f for f in filenames if f not in SKIP):
+                path = Path(dirpath) / name
+                if path.is_symlink():
+                    print(f"Skipping symlink {path}")
+                    continue
+                if path.is_dir() or path.is_file():
+                    tar.add(path, arcname=f"source/{(rel / name).as_posix()}", recursive=False, filter=_normalize)
