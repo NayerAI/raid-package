@@ -61,19 +61,24 @@ class Raid:
         return target
 
     def check(self, challenge):
-        """Score ./<challenge>/ locally with scoring/score.py:score() on data/. Returns the score."""
-        target = self.path / _check(challenge)
+        """Score ./<challenge>/ locally: scoring/score.py's score() on data/. Returns the score."""
+        target = (self.path / _check(challenge)).resolve()
         script = target / "scoring" / "score.py"
         if not script.is_file():
             raise RaidError(f"{script} not found. Fetch the challenge first.")
-        spec = importlib.util.spec_from_file_location(f"raid_score_{challenge.replace('-', '_')}", script)
-        module = importlib.util.module_from_spec(spec)
-        sys.path.insert(0, str(script.parent))
+        paths = [str(script.parent), str(target)]  # score.py imports the solution, e.g. `from main import md5`
+        sys.path[:0] = paths
         try:
+            spec = importlib.util.spec_from_file_location("score", script)
+            module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            value = module.score()
+            value = module.score(target / "data")
         finally:
-            sys.path.remove(str(script.parent))
+            for p in paths:
+                sys.path.remove(p)
+            for name, mod in list(sys.modules.items()):  # a later check sees the current solution
+                if target in Path(getattr(mod, "__file__", None) or "/").resolve().parents:
+                    del sys.modules[name]
         print(f"Score: {value}")
         return value
 
