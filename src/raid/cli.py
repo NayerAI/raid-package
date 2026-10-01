@@ -1,17 +1,17 @@
-"""Command line tools: task-fetch, task-check and task-submit."""
+"""Command line tools: task-fetch, task-check, task-submit and task-push."""
 import argparse
 import sys
 
 from . import Raid, RaidError
 
 
-def _run(description, action, key=True, options=()):
+def _run(description, action, key=True, options=(), target=("challenge", "challenge name, e.g. self-assessment")):
     parser = argparse.ArgumentParser(description=description)
     if key:
         parser.add_argument("--api-key", help="your API key (default: $RAID_KEY)")
     for flag, text in options:
         parser.add_argument(flag, action="store_true", help=text)
-    parser.add_argument("challenge", help="challenge name, e.g. self-assessment")
+    parser.add_argument(target[0], help=target[1])
     args = parser.parse_args()
     try:
         action(Raid(getattr(args, "api_key", None)), args)
@@ -38,3 +38,9 @@ def submit():
         except KeyboardInterrupt:
             sys.exit("\nStopped waiting. Your submission is still being scored.")
     _run("Submit ./<challenge>/ (without data/, scoring/ and .raidignore patterns), wait for the score and print the log.", action)
+
+
+def push():
+    _run("Admins: upload a challenge directory (without reference/) as its new active version. "
+         "challenge.yaml supplies the name, the version and the metadata of a new challenge.",
+         lambda raid, a: raid.push(a.directory), target=("directory", "challenge directory, e.g. self-assessment"))

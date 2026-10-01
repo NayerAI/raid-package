@@ -15,11 +15,11 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
-OWN = {"data", "scoring", "hidden", "reference"}  # parts of the challenge directory that are never submitted
+OWN = {"data", "scoring", "hidden", "reference", "challenge.yaml"}  # parts of the challenge directory that are never submitted
 SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -50,6 +50,7 @@ class Raid:
             print(f"{target}/ already exists. Fetch with force=True (task-fetch --force) to download it again "
                   "(this overwrites the challenge files).")
             return target
+        info = self._json(f"/api/challenges/{challenge}")
         with tempfile.TemporaryDirectory() as tmp:
             for part in PARTS:
                 with self._request("GET", f"/api/challenges/{challenge}/{part}.tar.gz", timeout=300) as r, \
@@ -58,7 +59,7 @@ class Raid:
             target.mkdir(parents=True, exist_ok=True)
             for part in PARTS:
                 _extract(Path(tmp) / f"{part}.tar.gz", target, part)
-        print(f"Fetched {challenge} into {target}/. Start with {target / 'README.txt'}.")
+        print(f"Fetched {challenge} (version {info['version']}) into {target}/. Start with {target / 'README.txt'}.")
         return target
 
     def check(self, challenge, hidden=False, reference=False):
@@ -107,8 +108,30 @@ class Raid:
                     "POST", f"/api/submit/{challenge}", data=f, timeout=900,
                     headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
                 result = json.load(r)
-        print(f"Submitted {challenge} ({size / 1e6:.2f} MB) as submission {result['id']}.")
+        print(f"Submitted {challenge} ({size / 1e6:.2f} MB) as submission {result['id']} (challenge version {result['version']}).")
         return result["id"]
+
+    def push(self, directory):
+        """Admins: upload a challenge directory (everything but reference/) as a new, active version.
+
+        Its challenge.yaml supplies the name, the version and, for a new challenge, the metadata (title, wave,
+        baseline, badge_score, badge_points; later changes happen in the admin console). Returns the server's summary."""
+        target = Path(directory)
+        missing = [p for p in ("challenge.yaml", "data", "scoring", "hidden") if not (target / p).exists()]
+        if missing:
+            raise RaidError(f"Missing in {target}/: " + ", ".join(missing))
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "challenge.tar.gz"
+            _pack(target, archive, own={"reference"})
+            size = archive.stat().st_size
+            with open(archive, "rb") as f, self._request(
+                    "POST", "/api/admin/push", data=f, timeout=3600,
+                    headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
+                result = json.load(r)
+        wave = f"wave {result['wave']}" if result["wave"] else "the self-assessment"
+        print(f"Pushed {result['name']} version {result['version']} ({size / 1e6:.2f} MB) to {wave}"
+              + (", now active." if result["active"] else "."))
+        return result
 
     def wait(self, submission_id, poll=5):
         """Wait until a submission is scored, print its log and return its details."""
@@ -119,17 +142,18 @@ class Raid:
                 break
             time.sleep(poll)
         print(sub["log"] or "No log output.")
-        print(f"Submission {sub['id']}: {sub['status']}" + ("" if sub["score"] is None else f", score {sub['score']:.4f}"))
+        print(f"Submission {sub['id']} (version {sub['version']}): {sub['status']}"
+              + ("" if sub["score"] is None else f", score {sub['score']:.4f}"))
         return sub
 
     def status(self, challenge=None):
         """Print your submissions (newest first) and return them as a list of dicts."""
         query = f"?challenge={_check(challenge)}" if challenge else ""
         subs = self._json(f"/api/submissions{query}")["submissions"]
-        print(f"{'ID':>6}  {'CHALLENGE':<20} {'STATUS':<8} {'SCORE':>10}  SUBMITTED")
+        print(f"{'ID':>6}  {'CHALLENGE':<20} {'VERSION':<8} {'STATUS':<8} {'SCORE':>10}  SUBMITTED")
         for s in subs:
             score = "" if s["score"] is None else f"{s['score']:.4f}"
-            print(f"{s['id']:>6}  {s['challenge']:<20} {s['status']:<8} {score:>10}  {s['submitted_at'][:19]}")
+            print(f"{s['id']:>6}  {s['challenge']:<20} {s['version']:<8} {s['status']:<8} {score:>10}  {s['submitted_at'][:19]}")
         if not subs:
             print("No submissions yet.")
         return subs
@@ -203,16 +227,18 @@ def _ignored(target):
     return lambda rel: any(fnmatch.fnmatchcase("/".join(rel.parts[i:]), p) for p in patterns for i in range(len(rel.parts)))
 
 
-def _pack(target, archive):
-    """tar.gz of the challenge directory without data/, scoring/, hidden/, reference/ and the
-    .raidignore patterns. Regular files only; caches, VCS data and symlinks are left out."""
+def _pack(target, archive, own=OWN):
+    """tar.gz of the challenge directory without the top-level entries in own (by default data/, scoring/,
+    hidden/, reference/ and challenge.yaml) and the .raidignore patterns. Regular files only; caches,
+    VCS data and symlinks are left out."""
     ignored = _ignored(target)
     with tarfile.open(archive, "w:gz") as tar:
         for dirpath, dirnames, filenames in os.walk(target):
             rel = Path(dirpath).relative_to(target)
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (rel == Path(".") and d in OWN)
-                                 and not ignored(rel / d))
-            for name in dirnames + sorted(f for f in filenames if f not in SKIP and not ignored(rel / f)):
+            top = rel == Path(".")
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (top and d in own) and not ignored(rel / d))
+            files = sorted(f for f in filenames if f not in SKIP and not (top and f in own) and not ignored(rel / f))
+            for name in dirnames + files:
                 path = Path(dirpath) / name
                 if path.is_symlink():
                     print(f"Skipping symlink {path}")
