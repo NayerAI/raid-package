@@ -5,13 +5,13 @@ import sys
 from . import Raid, RaidError
 
 
-def _run(description, action, key=True, force=False):
+def _run(description, action, key=True, options=()):
     parser = argparse.ArgumentParser(description=description)
     if key:
         parser.add_argument("--api-key", help="your API key (default: $RAID_KEY)")
-    if force:
-        parser.add_argument("--force", action="store_true", help="download again and overwrite the challenge files")
-    parser.add_argument("challenge", help="challenge name, e.g. md5")
+    for flag, text in options:
+        parser.add_argument(flag, action="store_true", help=text)
+    parser.add_argument("challenge", help="challenge name, e.g. self-assessment")
     args = parser.parse_args()
     try:
         action(Raid(getattr(args, "api_key", None)), args)
@@ -20,11 +20,14 @@ def _run(description, action, key=True, force=False):
 
 
 def fetch():
-    _run("Download a challenge into ./<challenge>/.", lambda raid, a: raid.fetch(a.challenge, a.force), force=True)
+    _run("Download a challenge into ./<challenge>/.", lambda raid, a: raid.fetch(a.challenge, a.force),
+         options=[("--force", "download again and overwrite the challenge files")])
 
 
 def check():
-    _run("Score ./<challenge>/ locally on data/.", lambda raid, a: raid.check(a.challenge), key=False)
+    _run("Score ./<challenge>/ locally on data/.", lambda raid, a: raid.check(a.challenge, a.hidden, a.reference),
+         key=False, options=[("--hidden", "challenge authors: score on hidden/ instead of data/"),
+                             ("--reference", "challenge authors: score reference/ instead of the student files")])
 
 
 def submit():
@@ -34,4 +37,4 @@ def submit():
             raid.wait(sid)
         except KeyboardInterrupt:
             sys.exit("\nStopped waiting. Your submission is still being scored.")
-    _run("Submit ./<challenge>/ (without data/ and scoring/), wait for the score and print the log.", action)
+    _run("Submit ./<challenge>/ (without data/, scoring/ and .raidignore patterns), wait for the score and print the log.", action)

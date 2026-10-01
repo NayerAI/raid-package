@@ -1,4 +1,5 @@
 """Client for the RAID competition system: fetch challenges, check and submit solutions."""
+import fnmatch
 import importlib.util
 import json
 import os
@@ -18,7 +19,7 @@ __version__ = "0.2.0"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
-OWN = {"data", "scoring"}  # fetched with the challenge, never submitted
+OWN = {"data", "scoring", "hidden", "reference"}  # parts of the challenge directory that are never submitted
 SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -60,19 +61,26 @@ class Raid:
         print(f"Fetched {challenge} into {target}/. Start with {target / 'README.txt'}.")
         return target
 
-    def check(self, challenge):
-        """Score ./<challenge>/ locally: scoring/score.py's score() on data/. Returns the score."""
+    def check(self, challenge, hidden=False, reference=False):
+        """Score ./<challenge>/ locally: scoring/score.py's score() on data/. Returns the score.
+
+        For challenge authors: hidden=True scores on hidden/, reference=True scores the files
+        in reference/ in place of the student files.
+        """
         target = (self.path / _check(challenge)).resolve()
         script = target / "scoring" / "score.py"
-        if not script.is_file():
-            raise RaidError(f"{script} not found. Fetch the challenge first.")
-        paths = [str(script.parent), str(target)]  # score.py imports the solution, e.g. `from main import md5`
+        dataset = target / ("hidden" if hidden else "data")
+        solution = target / "reference" if reference else target
+        for path in (script, dataset, solution):
+            if not path.exists():
+                raise RaidError(f"{path} not found." + (" Fetch the challenge first." if path == script else ""))
+        paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
         sys.path[:0] = paths
         try:
             spec = importlib.util.spec_from_file_location("score", script)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            value = module.score(target / "data")
+            value = module.score(dataset)
         finally:
             for p in paths:
                 sys.path.remove(p)
@@ -83,7 +91,7 @@ class Raid:
         return value
 
     def submit(self, challenge):
-        """Pack ./<challenge>/ without data/ and scoring/ and submit it for scoring. Returns the submission id."""
+        """Pack ./<challenge>/ (see _pack) and submit it for scoring. Returns the submission id."""
         target = self.path / _check(challenge)
         if not target.is_dir():
             raise RaidError(f"{target}/ not found. Fetch the challenge first.")
@@ -187,14 +195,24 @@ def _normalize(info):
     return info
 
 
+def _ignored(target):
+    """Patterns of <challenge>/.raidignore (tar exclude patterns, matched against any path suffix)."""
+    path = target / ".raidignore"
+    lines = path.read_text().splitlines() if path.is_file() else []
+    patterns = [line.strip().rstrip("/") for line in lines if line.strip() and not line.startswith("#")]
+    return lambda rel: any(fnmatch.fnmatchcase("/".join(rel.parts[i:]), p) for p in patterns for i in range(len(rel.parts)))
+
+
 def _pack(target, archive):
-    """tar.gz of the challenge directory without data/ and scoring/. Regular files only;
-    caches, VCS data and symlinks are left out."""
+    """tar.gz of the challenge directory without data/, scoring/, hidden/, reference/ and the
+    .raidignore patterns. Regular files only; caches, VCS data and symlinks are left out."""
+    ignored = _ignored(target)
     with tarfile.open(archive, "w:gz") as tar:
         for dirpath, dirnames, filenames in os.walk(target):
             rel = Path(dirpath).relative_to(target)
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (rel == Path(".") and d in OWN))
-            for name in dirnames + sorted(f for f in filenames if f not in SKIP):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (rel == Path(".") and d in OWN)
+                                 and not ignored(rel / d))
+            for name in dirnames + sorted(f for f in filenames if f not in SKIP and not ignored(rel / f)):
                 path = Path(dirpath) / name
                 if path.is_symlink():
                     print(f"Skipping symlink {path}")
