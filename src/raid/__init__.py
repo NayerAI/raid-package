@@ -1,20 +1,24 @@
-"""Client for the RAID competition system: fetch challenges, submit solutions, check results."""
+"""Client for the RAID competition system: fetch challenges, check and submit solutions."""
+import importlib.util
 import json
 import os
 import posixpath
 import re
 import shutil
+import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
-PARTS = ("source", "data", "scoring")
+PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
+OWN = {"data", "scoring"}  # fetched with the challenge, never submitted
 SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -26,8 +30,8 @@ class RaidError(Exception):
 class Raid:
     """raid = Raid(api_key); print(raid.howto())"""
 
-    def __init__(self, api_key, url=None, path="."):
-        self.api_key = api_key.strip()
+    def __init__(self, api_key=None, url=None, path="."):
+        self.api_key = (api_key or os.environ.get("RAID_KEY") or "").strip()
         self.url = (url or os.environ.get("RAID_URL") or DEFAULT_URL).rstrip("/")
         self.path = Path(path)
 
@@ -36,13 +40,13 @@ class Raid:
         return self._json("/api/howto")["text"]
 
     def fetch(self, challenge, force=False):
-        """Download source/, data/ and scoring/ of a challenge into ./<challenge>/.
+        """Download a challenge into ./<challenge>/: its files, data/ and scoring/.
 
         An existing directory is left untouched unless force=True, which overwrites the challenge files.
         """
         target = self.path / _check(challenge)
         if target.exists() and not force:
-            print(f"{target}/ already exists. Use raid.fetch({challenge!r}, force=True) to download it again "
+            print(f"{target}/ already exists. Fetch with force=True (task-fetch --force) to download it again "
                   "(this overwrites the challenge files).")
             return target
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,29 +57,57 @@ class Raid:
             target.mkdir(parents=True, exist_ok=True)
             for part in PARTS:
                 _extract(Path(tmp) / f"{part}.tar.gz", target, part)
-        print(f"Fetched {challenge} into {target}/. Start with {target / 'source' / 'README.txt'}.")
+        print(f"Fetched {challenge} into {target}/. Start with {target / 'README.txt'}.")
         return target
 
+    def check(self, challenge):
+        """Score ./<challenge>/ locally with scoring/score.py:score() on data/. Returns the score."""
+        target = self.path / _check(challenge)
+        script = target / "scoring" / "score.py"
+        if not script.is_file():
+            raise RaidError(f"{script} not found. Fetch the challenge first.")
+        spec = importlib.util.spec_from_file_location(f"raid_score_{challenge.replace('-', '_')}", script)
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(script.parent))
+        try:
+            spec.loader.exec_module(module)
+            value = module.score()
+        finally:
+            sys.path.remove(str(script.parent))
+        print(f"Score: {value}")
+        return value
+
     def submit(self, challenge):
-        """Pack ./<challenge>/source/ and submit it for scoring. Returns the submission id."""
-        source = self.path / _check(challenge) / "source"
-        if not source.is_dir():
-            raise RaidError(f"{source}/ not found. Run raid.fetch({challenge!r}) first.")
+        """Pack ./<challenge>/ without data/ and scoring/ and submit it for scoring. Returns the submission id."""
+        target = self.path / _check(challenge)
+        if not target.is_dir():
+            raise RaidError(f"{target}/ not found. Fetch the challenge first.")
         required = self._json(f"/api/challenges/{challenge}")["required_files"]
-        missing = [f for f in required if not (source / f).is_file()]
+        missing = [f for f in required if not (target / f).is_file()]
         if missing:
-            raise RaidError(f"Missing required files in {source}/: " + ", ".join(missing))
+            raise RaidError(f"Missing required files in {target}/: " + ", ".join(missing))
         with tempfile.TemporaryDirectory() as tmp:
-            archive = Path(tmp) / "source.tar.gz"
-            _pack(source, archive)
+            archive = Path(tmp) / "submission.tar.gz"
+            _pack(target, archive)
             size = archive.stat().st_size
             with open(archive, "rb") as f, self._request(
                     "POST", f"/api/submit/{challenge}", data=f, timeout=900,
                     headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
                 result = json.load(r)
-        print(f"Submitted {challenge} ({size / 1e6:.2f} MB) as submission {result['id']}. "
-              f"Check it with raid.status({challenge!r}).")
+        print(f"Submitted {challenge} ({size / 1e6:.2f} MB) as submission {result['id']}.")
         return result["id"]
+
+    def wait(self, submission_id, poll=5):
+        """Wait until a submission is scored, print its log and return its details."""
+        print("Waiting for the scoring (Ctrl-C stops waiting, the scoring continues) ...", flush=True)
+        while True:
+            sub = self._json(f"/api/submissions/{int(submission_id)}")
+            if sub["status"] in ("success", "failed"):
+                break
+            time.sleep(poll)
+        print(sub["log"] or "No log output.")
+        print(f"Submission {sub['id']}: {sub['status']}" + ("" if sub["score"] is None else f", score {sub['score']:.4f}"))
+        return sub
 
     def status(self, challenge=None):
         """Print your submissions (newest first) and return them as a list of dicts."""
@@ -94,6 +126,8 @@ class Raid:
         return self._json(f"/api/submissions/{int(submission_id)}")["log"]
 
     def _request(self, method, endpoint, data=None, headers=None, timeout=60):
+        if not self.api_key:
+            raise RaidError("No API key. Pass --api-key or set RAID_KEY.")
         req = urllib.request.Request(self.url + endpoint, data=data, method=method, headers={
             "Authorization": f"Bearer {self.api_key}", "User-Agent": f"raid/{__version__}", **(headers or {})})
         try:
@@ -119,15 +153,17 @@ def _check(challenge):
 
 
 def _extract(archive, target, part):
-    """Extract only regular files and directories below part/, never outside target."""
+    """Extract only regular files and directories below part/, never outside target. source/ maps to target."""
     root = target.resolve()
     with tarfile.open(archive, "r:gz") as tar:
         for member in tar:
             name = posixpath.normpath(member.name)
             if name != part and not name.startswith(part + "/"):
                 raise RaidError(f"Unexpected entry {member.name!r} in the {part} archive.")
+            if part == "source":
+                name = name[len("source/"):] or "."
             dest = (root / name).resolve()
-            if root not in dest.parents:
+            if dest != root and root not in dest.parents:
                 raise RaidError(f"Unsafe entry {member.name!r} in the {part} archive.")
             if member.isdir():
                 dest.mkdir(parents=True, exist_ok=True)
@@ -146,17 +182,17 @@ def _normalize(info):
     return info
 
 
-def _pack(source, archive):
-    """tar.gz of source/ with regular files only; caches, VCS data and symlinks are left out."""
+def _pack(target, archive):
+    """tar.gz of the challenge directory without data/ and scoring/. Regular files only;
+    caches, VCS data and symlinks are left out."""
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(source, arcname="source", recursive=False, filter=_normalize)
-        for dirpath, dirnames, filenames in os.walk(source):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP)
-            rel = Path(dirpath).relative_to(source)
+        for dirpath, dirnames, filenames in os.walk(target):
+            rel = Path(dirpath).relative_to(target)
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (rel == Path(".") and d in OWN))
             for name in dirnames + sorted(f for f in filenames if f not in SKIP):
                 path = Path(dirpath) / name
                 if path.is_symlink():
                     print(f"Skipping symlink {path}")
                     continue
                 if path.is_dir() or path.is_file():
-                    tar.add(path, arcname=f"source/{(rel / name).as_posix()}", recursive=False, filter=_normalize)
+                    tar.add(path, arcname=(rel / name).as_posix(), recursive=False, filter=_normalize)
