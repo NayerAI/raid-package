@@ -77,12 +77,14 @@ class Raid:
                 raise RaidError(f"{path} not found." + (" Fetch the challenge first." if path == script else ""))
         paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
         sys.path[:0] = paths
+        os.environ["RAID_SOLUTION"] = str(solution)  # where score.py finds files that are not imported, e.g. solution.c
         try:
             spec = importlib.util.spec_from_file_location("score", script)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             value = module.score(dataset)
         finally:
+            del os.environ["RAID_SOLUTION"]
             for p in paths:
                 sys.path.remove(p)
             for name, mod in list(sys.modules.items()):  # a later check sees the current solution
