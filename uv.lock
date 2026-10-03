@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.9"
 
 [[package]]
-name = "raid"
+name = "mlsec-raid"
 version = "0.3.0"
 source = { editable = "." }
