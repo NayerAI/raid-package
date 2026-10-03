@@ -1,6 +1,6 @@
 [project]
 name = "mlsec-raid"
-version = "0.3.0"
+version = "0.4.0"
 description = "Client for the RAID competition system"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -10,7 +10,10 @@ dependencies = []
 task-fetch = "raid.cli:fetch"
 task-check = "raid.cli:check"
 task-submit = "raid.cli:submit"
+task-show = "raid.cli:show"
+task-log = "raid.cli:log"
 task-push = "raid.cli:push"
+task = "raid.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.17,<0.9.0"]

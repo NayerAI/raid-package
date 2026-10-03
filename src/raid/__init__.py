@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
@@ -110,7 +110,7 @@ class Raid:
                     "POST", f"/api/submit/{challenge}", data=f, timeout=900,
                     headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
                 result = json.load(r)
-        print(f"Submitted {challenge} ({size / 1e6:.2f} MB) as submission {result['id']} (challenge version {result['version']}).")
+        print("Job submitted!\nRun task-show to see the status of your jobs.")
         return result["id"]
 
     def push(self, directory):
@@ -149,20 +149,27 @@ class Raid:
         return sub
 
     def status(self, challenge=None):
-        """Print your submissions (newest first) and return them as a list of dicts."""
+        """Print your jobs (submissions, newest first) and return them as a list of dicts."""
         query = f"?challenge={_check(challenge)}" if challenge else ""
         subs = self._json(f"/api/submissions{query}")["submissions"]
-        print(f"{'ID':>6}  {'CHALLENGE':<20} {'VERSION':<8} {'STATUS':<8} {'SCORE':>10}  SUBMITTED")
+        print(f"{'JOB':>6}  {'CHALLENGE':<20} {'VERSION':<8} {'STATE':<8} {'SCORE':>10}  SUBMITTED")
         for s in subs:
             score = "" if s["score"] is None else f"{s['score']:.4f}"
             print(f"{s['id']:>6}  {s['challenge']:<20} {s['version']:<8} {s['status']:<8} {score:>10}  {s['submitted_at'][:19]}")
         if not subs:
-            print("No submissions yet.")
+            print("No jobs yet.")
+        else:
+            print("Run task-log <job> to see the log of a finished job.")
         return subs
 
     def log(self, submission_id):
-        """Return the scoring log of one of your submissions."""
-        return self._json(f"/api/submissions/{int(submission_id)}")["log"]
+        """Return the scoring log of one of your finished submissions: the output and errors of the scoring run."""
+        if not str(submission_id).isdigit():
+            raise RaidError(f"Invalid job id {submission_id!r}. task-show lists your jobs.")
+        sub = self._json(f"/api/submissions/{submission_id}")
+        if sub["status"] in ("pending", "running"):
+            raise RaidError(f"Job {sub['id']} is {sub['status']}. Its log is available once it has finished.")
+        return sub["log"] or "No log output."
 
     def _request(self, method, endpoint, data=None, headers=None, timeout=60):
         if not self.api_key:

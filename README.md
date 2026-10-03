@@ -8,8 +8,12 @@ export RAID_KEY=<your-api-key>                            # or pass --api-key <y
 
 task-fetch <challenge>    # downloads the challenge into ./<challenge>/
 task-check <challenge>    # scores it locally with scoring/score.py on data/
-task-submit <challenge>   # submits ./<challenge>/ without data/, scoring/ and .raidignore patterns, prints score and log
+task-submit <challenge>   # submits ./<challenge>/ without data/, scoring/ and .raidignore patterns
+task-show                 # lists your jobs with their state (pending, running, success, failed) and score
+task-log <job>            # prints the log of a finished job, including the errors of your solution
 ```
+
+Every command also works as `task <command>`, e.g. `task submit <challenge>`.
 
 The same is available in Python: `Raid(api_key).fetch(...)`, `.check(...)`, `.submit(...)`, `.push(...)`, `.wait(id)`, `.status()`, `.log(id)`, `.howto()`.
 
