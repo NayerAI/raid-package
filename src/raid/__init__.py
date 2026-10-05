@@ -116,8 +116,8 @@ class Raid:
     def push(self, directory):
         """Admins: upload a challenge directory (everything but reference/) as a new, active version.
 
-        Its challenge.yaml supplies the name, the version and, for a new challenge, the metadata (title, wave,
-        baseline, badge_score, badge_points; later changes happen in the admin console). Returns the server's summary."""
+        Its challenge.yaml supplies the name, the version and the metadata (title, wave, baseline, badge_score,
+        badge_points); keys it leaves out keep their current values. Returns the server's summary."""
         target = Path(directory)
         missing = [p for p in ("challenge.yaml", "data", "scoring", "hidden") if not (target / p).exists()]
         if missing:

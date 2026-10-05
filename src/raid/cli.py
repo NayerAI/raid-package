@@ -47,7 +47,7 @@ def log():
 
 def push():
     _run("Admins: upload a challenge directory (without reference/) as its new active version. "
-         "challenge.yaml supplies the name, the version and the metadata of a new challenge.",
+         "challenge.yaml supplies the name, the version and the metadata.",
          lambda raid, a: raid.push(a.directory), target=("directory", "challenge directory, e.g. self-assessment"))
 
 
