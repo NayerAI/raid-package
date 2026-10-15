@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
@@ -151,7 +151,8 @@ class Raid:
     def status(self, challenge=None):
         """Print your jobs (submissions, newest first) and return them as a list of dicts."""
         query = f"?challenge={_check(challenge)}" if challenge else ""
-        subs = self._json(f"/api/submissions{query}")["submissions"]
+        result = self._json(f"/api/submissions{query}")
+        subs = result["submissions"]
         print(f"{'JOB':>6}  {'CHALLENGE':<20} {'VERSION':<8} {'STATE':<8} {'SCORE':>10}  SUBMITTED")
         for s in subs:
             score = "" if s["score"] is None else f"{s['score']:.4f}"
@@ -160,6 +161,12 @@ class Raid:
             print("No jobs yet.")
         else:
             print("Run task-log <job> to see the log of a finished job.")
+        limits = result.get("daily_limits") or []
+        if limits:
+            print("\nDaily submission limits (in competition mode per team, reset at 00:00 UTC):")
+            for d in limits:
+                left = max(d["submissions_per_day"] - d["submitted_today"], 0)
+                print(f"  {d['challenge']:<20} {left} of {d['submissions_per_day']} left today")
         return subs
 
     def log(self, submission_id):
