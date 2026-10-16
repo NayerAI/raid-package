@@ -23,7 +23,7 @@ PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge 
 # Parts of the challenge directory that are never submitted: these top-level entries and artifact/data/
 OWN = {"data", "scoring", "hidden", "reference", "challenge.yaml", "entrypoint.sh"}
 ARTIFACT_DATA = Path("artifact", "data")  # the data/ part of challenges split into artifact/ and method/
-CHECKS = {"method": "Method score", "artifact": "Artifact score", None: "Score"}  # the part checked: what it prints
+CHECKS = {"method": "Verification score", "artifact": "Artifact score", None: "Score"}  # the part checked: what it prints
 SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -72,8 +72,8 @@ class Raid:
     def check(self, challenge, part=None, hidden=False, reference=False, container=True, rebuild=False):
         """Check ./<challenge>/ locally with scoring/score.py on its data (artifact/data/ or data/). Returns the score.
 
-        part="method" calls score.py's method(), part="artifact" its artifact() and part=None its score(), which
-        checks the method first and then the artifact. It runs in the container raid-<challenge>, built like the
+        part="method" calls score.py's method() (the verification score), part="artifact" its artifact() (the
+        artifact score) and part=None its score(), which checks the method first and then the artifact. It runs in the container raid-<challenge>, built like the
         backend's sandbox with the challenge's setup.sh (Docker, else udocker) and rebuilt when setup.sh changes or
         rebuild=True; container=False runs it on this machine instead.
 
