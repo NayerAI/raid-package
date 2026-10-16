@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
@@ -54,8 +54,11 @@ class Raid:
         with tempfile.TemporaryDirectory() as tmp:
             for part in PARTS:
                 with self._request("GET", f"/api/challenges/{challenge}/{part}.tar.gz", timeout=300) as r, \
-                        open(Path(tmp) / f"{part}.tar.gz", "wb") as f:
-                    shutil.copyfileobj(r, f, 1 << 20)
+                        open(Path(tmp) / f"{part}.tar.gz", "wb") as f, \
+                        _Progress(f"Downloading {part}", r.headers.get("Content-Length")) as bar:
+                    while chunk := r.read(1 << 16):
+                        f.write(chunk)
+                        bar.update(len(chunk))
             target.mkdir(parents=True, exist_ok=True)
             for part in PARTS:
                 _extract(Path(tmp) / f"{part}.tar.gz", target, part)
@@ -104,10 +107,11 @@ class Raid:
             raise RaidError(f"Missing required files in {target}/: " + ", ".join(missing))
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "submission.tar.gz"
+            _status(f"Packing {target}/ ...")
             _pack(target, archive)
             size = archive.stat().st_size
-            with open(archive, "rb") as f, self._request(
-                    "POST", f"/api/submit/{challenge}", data=f, timeout=900,
+            with open(archive, "rb") as f, _Progress("Uploading", size) as bar, self._request(
+                    "POST", f"/api/submit/{challenge}", data=bar.reader(f), timeout=900,
                     headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
                 result = json.load(r)
         print("Job submitted!\nRun task-show to see the status of your jobs.")
@@ -124,10 +128,11 @@ class Raid:
             raise RaidError(f"Missing in {target}/: " + ", ".join(missing))
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "challenge.tar.gz"
+            _status(f"Packing {target}/ ...")
             _pack(target, archive, own={"reference"})
             size = archive.stat().st_size
-            with open(archive, "rb") as f, self._request(
-                    "POST", "/api/admin/push", data=f, timeout=3600,
+            with open(archive, "rb") as f, _Progress("Uploading", size) as bar, self._request(
+                    "POST", "/api/admin/push", data=bar.reader(f), timeout=3600,
                     headers={"Content-Type": "application/gzip", "Content-Length": str(size)}) as r:
                 result = json.load(r)
         wave = f"wave {result['wave']}" if result["wave"] else "the self-assessment"
@@ -197,6 +202,63 @@ class Raid:
     def _json(self, endpoint):
         with self._request("GET", endpoint) as r:
             return json.load(r)
+
+
+def _status(text):
+    """A transient line on stderr, only when it is a terminal."""
+    if sys.stderr.isatty():
+        sys.stderr.write(f"\r\033[K{text}")
+        sys.stderr.flush()
+
+
+class _Progress:
+    """A one-line progress bar on stderr, only when it is a terminal. Without a known total it counts bytes."""
+
+    def __init__(self, label, total=None):
+        self.label, self.total, self.done, self.shown = label, int(total) if total else None, 0, 0.0
+        self.tty = sys.stderr.isatty()
+
+    def __enter__(self):
+        self._draw(force=True)
+        return self
+
+    def __exit__(self, *exc):
+        if self.tty:
+            self._draw(force=True)
+            sys.stderr.write("\n" if exc[0] is None else "\r\033[K")
+            sys.stderr.flush()
+
+    def update(self, n):
+        self.done += n
+        self._draw()
+
+    def reader(self, f):
+        """f with a read() that advances the bar, for uploads."""
+        bar = self
+
+        class Reader:
+            def read(self, n=-1):
+                chunk = f.read(n)
+                bar.update(len(chunk))
+                return chunk
+        return Reader()
+
+    def _draw(self, force=False):
+        now = time.monotonic()
+        if not self.tty or (not force and now - self.shown < 0.1):
+            return
+        self.shown = now
+        if self.total:
+            frac = min(self.done / self.total, 1)
+            line = f"{self.label} [{'#' * int(frac * 30):<30}] {frac:4.0%}  {_size(self.done)} of {_size(self.total)}"
+        else:
+            line = f"{self.label} {_size(self.done)}"
+        sys.stderr.write(f"\r\033[K{line}")
+        sys.stderr.flush()
+
+
+def _size(n):
+    return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{n / 1e3:.0f} kB"
 
 
 def _check(challenge):
