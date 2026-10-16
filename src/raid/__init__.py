@@ -69,13 +69,14 @@ class Raid:
         print(f"Fetched {challenge} (version {info['version']}) into {target}/. Start with {target / 'README.txt'}.")
         return target
 
-    def check(self, challenge, part=None, hidden=False, reference=False, container=True, rebuild=False):
+    def check(self, challenge, part=None, hidden=False, reference=False, container=True, rebuild=False, quiet=False):
         """Check ./<challenge>/ locally with scoring/score.py on its data (artifact/data/ or data/). Returns the score.
 
         part="method" calls score.py's method() (the verification score), part="artifact" its artifact() (the
         artifact score) and part=None its score(), which checks the method first and then the artifact. It runs in the container raid-<challenge>, built like the
         backend's sandbox with the challenge's setup.sh (Docker, else udocker) and rebuilt when setup.sh changes or
-        rebuild=True; container=False runs it on this machine instead.
+        rebuild=True; container=False runs it on this machine instead. The output of the build and of everything
+        score.py runs (method/run, make, tests) is shown unless quiet=True; score.py reads $RAID_VERBOSE for it.
 
         For challenge authors: hidden=True scores on hidden/, reference=True scores the files
         in reference/ in place of the student files. Raises RaidError when scoring stops without a score.
@@ -104,7 +105,8 @@ class Raid:
             if kind is None:
                 raise RaidError("task check needs Docker or udocker (pip install udocker) to build the container "
                                 f"raid-{challenge}. Pass --no-container to check on this machine instead.")
-            box = _container.Container(challenge, target, kind)
+            box = _container.Container(challenge, target, kind,
+                                       None if quiet else lambda line: _write("    " + line.replace(here, "")))
             print(f"Checking {what}: {files} on {shown} in {box.name} ({kind})")
             try:
                 box.ensure(rebuild, status=lambda text: print(_indent(text, here)))
@@ -113,10 +115,12 @@ class Raid:
             inside = (str(target) + os.sep).replace(here, "")  # /job/ in the container is the challenge directory
             with _Indented(here, {"/job/": inside}) as out:
                 result = box.call(function, dataset, solution, out.write)
-            result["traceback"] = result.get("traceback", "").replace("/job/", inside)
+            for key in ("traceback", "exit"):  # paths in the container
+                if isinstance(result.get(key), str):
+                    result[key] = result[key].replace("/job/", inside)
         else:
             print(f"Checking {what}: {files} on {shown}")
-            result = _call_here(function, script, dataset, solution, target, here)
+            result = _call_here(function, script, dataset, solution, target, here, quiet)
         if "exit" in result:
             raise RaidError("No score, scoring stopped:\n" + _indent(str(result["exit"]).strip(), here))
         if "error" in result:
@@ -281,6 +285,11 @@ class _Indented:
         sys.stdout, sys.stderr = self.saved
 
 
+def _write(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
 def _indent(text, here):
     return "\n".join("  " + line.replace(here, "") if line.strip() else line for line in text.splitlines())
 
@@ -362,11 +371,13 @@ def _functions(script):
     return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
-def _call_here(function, script, dataset, solution, target, here):
+def _call_here(function, script, dataset, solution, target, here, quiet=False):
     """Call function of score.py on dataset in this process, as the container's runner does. Returns its result dict."""
     paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
     sys.path[:0] = paths
     os.environ["RAID_SOLUTION"] = str(solution)  # where score.py finds files that are not imported, e.g. solution.c
+    if not quiet:
+        os.environ["RAID_VERBOSE"] = "1"  # score.py prints the output of everything it runs
     try:
         with _Indented(here):  # score.py's own output, set off from the result
             spec = importlib.util.spec_from_file_location("score", script)
@@ -382,6 +393,7 @@ def _call_here(function, script, dataset, solution, target, here):
         return {"error": type(e).__name__, "traceback": _traceback(e, target)}
     finally:
         del os.environ["RAID_SOLUTION"]
+        os.environ.pop("RAID_VERBOSE", None)
         for p in paths:
             sys.path.remove(p)
         for name, mod in list(sys.modules.items()):  # a later check sees the current solution

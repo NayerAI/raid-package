@@ -42,9 +42,11 @@ def check():
         if len(names) > 2 or len(names) == 2 and names[0] not in ("method", "artifact"):
             parser.error("expected [method|artifact] <challenge>")
         part, challenge = (None, names[0]) if len(names) == 1 else names
-        raid.check(challenge, part, a.hidden, a.reference, container=not a.no_container, rebuild=a.rebuild)
+        raid.check(challenge, part, a.hidden, a.reference, container=not a.no_container, rebuild=a.rebuild,
+                   quiet=a.quiet)
 
     _run(None, action, key=False, target=None, parser=parser, options=[
+        ("--quiet", "hide the output of the container build and of what scoring runs (method/run, make, tests)"),
         ("--rebuild", "build the container raid-<challenge> again even if setup.sh did not change"),
         ("--no-container", "check on this machine instead of in the container (needs the challenge's packages)"),
         ("--hidden", "challenge authors: score on hidden/ instead of the data"),

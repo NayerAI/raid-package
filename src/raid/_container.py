@@ -70,8 +70,9 @@ def engine():
 
 
 class Container:
-    def __init__(self, challenge, target, kind):
-        self.name, self.target, self.kind = f"raid-{challenge}", target, kind
+    def __init__(self, challenge, target, kind, output=None):
+        """output: called with every line the build and score.py print (None: quiet, only errors)."""
+        self.name, self.target, self.kind, self.output = f"raid-{challenge}", target, kind, output
         self.packages = packages(target)
         setup = target / "setup.sh"
         self.setup = setup.read_bytes() if setup.is_file() else b""
@@ -139,9 +140,14 @@ class Container:
     def _step(self, cmd, setup=False):
         """Run a build command; on failure raise ContainerError with the end of its output. setup: the command
         installs the packages and runs setup.sh."""
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        lines = []
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL) as proc:
+            for line in iter(proc.stdout.readline, b""):
+                lines.append(line.decode(errors="replace"))
+                if self.output:
+                    self.output(lines[-1])
         if proc.returncode:
-            tail = "\n".join(proc.stdout.decode(errors="replace").rstrip().splitlines()[-40:])
+            tail = "".join(lines[-40:]).rstrip() if not self.output else "(the output is above)"
             step = " ".join(c for c in cmd[:4] if c not in ("-q", "--allow-root"))
             raise ContainerError(f"Building {self.name} failed in `{step} ...`:\n{tail}"
                                  + ("\nCheck setup.sh: it runs as root in the image build, with internet access." if setup else ""))
@@ -153,10 +159,12 @@ class Container:
 
     def call(self, function, dataset, solution, write=None):
         """Run function (score, method or artifact) of scoring/score.py on dataset in the container, with the
-        challenge directory at /job. Output goes to write line by line. Returns the runner's result dict."""
+        challenge directory at /job. Output goes to write line by line; score.py prints the output of everything it
+        runs unless the container is quiet. Returns the runner's result dict."""
         write = write or sys.stdout.write
         inside = lambda p: "/job/" + p.relative_to(self.target).as_posix() if p != self.target else "/job"  # noqa: E731
         env = {"HOME": "/tmp", "PATH": PATH, "RAID_SOLUTION": inside(solution), "PYTHONDONTWRITEBYTECODE": "1",
+               **({"RAID_VERBOSE": "1"} if self.output else {}),
                **{k: v for k, v in os.environ.items() if PASSED_ENV.match(k)}}
         with tempfile.TemporaryDirectory() as tmp:
             shutil.copy(RUNNER, Path(tmp, "runner.py"))
