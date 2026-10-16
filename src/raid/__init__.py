@@ -1,4 +1,5 @@
 """Client for the RAID competition system: fetch challenges, check and submit solutions."""
+import ast
 import fnmatch
 import importlib.util
 import json
@@ -15,11 +16,14 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
-OWN = {"data", "scoring", "hidden", "reference", "challenge.yaml"}  # parts of the challenge directory that are never submitted
+# Parts of the challenge directory that are never submitted: these top-level entries and artifact/data/
+OWN = {"data", "scoring", "hidden", "reference", "challenge.yaml", "entrypoint.sh"}
+ARTIFACT_DATA = Path("artifact", "data")  # the data/ part of challenges split into artifact/ and method/
+CHECKS = {"method": "Method score", "artifact": "Artifact score", None: "Score"}  # the part checked: what it prints
 SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -41,7 +45,7 @@ class Raid:
         return self._json("/api/howto")["text"]
 
     def fetch(self, challenge, force=False):
-        """Download a challenge into ./<challenge>/: its files, data/ and scoring/.
+        """Download a challenge into ./<challenge>/: its files, data/ (artifact/data/) and scoring/.
 
         An existing directory is left untouched unless force=True, which overwrites the challenge files.
         """
@@ -65,47 +69,62 @@ class Raid:
         print(f"Fetched {challenge} (version {info['version']}) into {target}/. Start with {target / 'README.txt'}.")
         return target
 
-    def check(self, challenge, hidden=False, reference=False):
-        """Score ./<challenge>/ locally: scoring/score.py's score() on data/. Returns the score.
+    def check(self, challenge, part=None, hidden=False, reference=False, container=True, rebuild=False):
+        """Check ./<challenge>/ locally with scoring/score.py on its data (artifact/data/ or data/). Returns the score.
+
+        part="method" calls score.py's method(), part="artifact" its artifact() and part=None its score(), which
+        checks the method first and then the artifact. It runs in the container raid-<challenge>, built like the
+        backend's sandbox with the challenge's setup.sh (Docker, else udocker) and rebuilt when setup.sh changes or
+        rebuild=True; container=False runs it on this machine instead.
 
         For challenge authors: hidden=True scores on hidden/, reference=True scores the files
         in reference/ in place of the student files. Raises RaidError when scoring stops without a score.
         """
+        if part not in CHECKS:
+            raise RaidError(f"Invalid check {part!r}, use method or artifact.")
         target = (self.path / _check(challenge)).resolve()
         script = target / "scoring" / "score.py"
-        dataset = target / ("hidden" if hidden else "data")
+        dataset = target / "hidden" if hidden else _data(target)
         solution = target / "reference" if reference else target
         for path in (script, dataset, solution):
             if not path.exists():
                 raise RaidError(f"{path} not found." + (" Fetch the challenge first." if path == script else ""))
+        function = part or "score"
+        defined = _functions(script)
+        if part and defined is not None and part not in defined:
+            raise RaidError(f"{challenge} has no separate {part} check (scoring/score.py has no {part}()). "
+                            f"Run task check {challenge}.")
         files = "reference/" if reference else "your files"
-        print(f"Checking {challenge}: {files} on {dataset.name}/")
+        what = f"{challenge} {part}" if part else challenge
         here = str(Path.cwd().resolve()) + os.sep  # shown paths are relative, e.g. self-assessment/solution.c
-        paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
-        sys.path[:0] = paths
-        os.environ["RAID_SOLUTION"] = str(solution)  # where score.py finds files that are not imported, e.g. solution.c
-        try:
-            with _Indented(here):  # score.py's own output, set off from the result
-                spec = importlib.util.spec_from_file_location("score", script)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                value = module.score(dataset)
-        except SystemExit as e:  # score.py stops with sys.exit("why"), e.g. when the solution does not compile
-            message = e.code if isinstance(e.code, str) else f"exit code {e.code}"
-            raise RaidError("No score, scoring stopped:\n" + _indent(message.strip(), here)) from None
-        except Exception as e:
-            raise RaidError(f"No score, scoring/score.py raised {type(e).__name__}:\n"
-                            + _indent(_traceback(e, target), here)
+        shown = f"{dataset.relative_to(target).as_posix()}/"
+        if container:
+            from . import _container
+            kind = _container.engine()
+            if kind is None:
+                raise RaidError("task check needs Docker or udocker (pip install udocker) to build the container "
+                                f"raid-{challenge}. Pass --no-container to check on this machine instead.")
+            box = _container.Container(challenge, target, kind)
+            print(f"Checking {what}: {files} on {shown} in {box.name} ({kind})")
+            try:
+                box.ensure(rebuild, status=lambda text: print(_indent(text, here)))
+            except _container.ContainerError as e:
+                raise RaidError(str(e)) from None
+            inside = (str(target) + os.sep).replace(here, "")  # /job/ in the container is the challenge directory
+            with _Indented(here, {"/job/": inside}) as out:
+                result = box.call(function, dataset, solution, out.write)
+            result["traceback"] = result.get("traceback", "").replace("/job/", inside)
+        else:
+            print(f"Checking {what}: {files} on {shown}")
+            result = _call_here(function, script, dataset, solution, target, here)
+        if "exit" in result:
+            raise RaidError("No score, scoring stopped:\n" + _indent(str(result["exit"]).strip(), here))
+        if "error" in result:
+            raise RaidError(f"No score, scoring/score.py raised {result['error']}:\n" + _indent(result["traceback"], here)
                             + ("\nInstall the packages the challenge needs, see its setup.sh."
-                               if isinstance(e, ModuleNotFoundError) else "")) from e
-        finally:
-            del os.environ["RAID_SOLUTION"]
-            for p in paths:
-                sys.path.remove(p)
-            for name, mod in list(sys.modules.items()):  # a later check sees the current solution
-                if target in Path(getattr(mod, "__file__", None) or "/").resolve().parents:
-                    del sys.modules[name]
-        print(f"\n{_bold(f'Score: {value:.4f}')}")
+                               if result["error"] == "ModuleNotFoundError" and not container else ""))
+        value = result["value"]
+        print(f"\n{_bold(f'{CHECKS[part]}: {value:.4f}')}")
         return value
 
     def submit(self, challenge):
@@ -135,7 +154,9 @@ class Raid:
         Its challenge.yaml supplies the name, the version and the metadata (title, wave, baseline, badge_score,
         badge_points); keys it leaves out keep their current values. Returns the server's summary."""
         target = Path(directory)
-        missing = [p for p in ("challenge.yaml", "data", "scoring", "hidden") if not (target / p).exists()]
+        missing = [p for p in ("challenge.yaml", "scoring", "hidden") if not (target / p).exists()]
+        if not (target / "data").is_dir() and not (target / ARTIFACT_DATA).is_dir():
+            missing.append(f"{ARTIFACT_DATA.as_posix()} (or data)")
         if missing:
             raise RaidError(f"Missing in {target}/: " + ", ".join(missing))
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,29 +245,35 @@ def _status(text):
 
 
 class _Indented:
-    """Indent everything printed to stdout and stderr inside the with block by two spaces; paths under here become relative."""
+    """Indent everything printed to stdout and stderr inside the with block by two spaces; paths under here become
+    relative, and the keys of paths (e.g. /job/ in the container) become their values."""
 
     class _Stream:
-        def __init__(self, stream, here):
-            self.stream, self.here, self.line_start = stream, here, True
+        def __init__(self, stream, paths):
+            self.stream, self.paths, self.line_start = stream, paths, True
 
         def write(self, text):
             for line in text.splitlines(keepends=True):
                 if self.line_start and line.strip():
                     self.stream.write("  ")
-                self.stream.write(line.replace(self.here, ""))
+                for old, new in self.paths.items():
+                    line = line.replace(old, new)
+                self.stream.write(line)
                 self.line_start = line.endswith(("\n", "\r"))
+            self.stream.flush()
             return len(text)
 
         def __getattr__(self, name):
             return getattr(self.stream, name)
 
-    def __init__(self, here=None):
-        self.here = here or "\0"
+    def __init__(self, here=None, paths=None):
+        self.paths = {here: ""} if here else {}
+        self.paths.update(paths or {})
 
     def __enter__(self):
         self.saved = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = self._Stream(sys.stdout, self.here), self._Stream(sys.stderr, self.here)
+        sys.stdout, sys.stderr = self._Stream(sys.stdout, self.paths), self._Stream(sys.stderr, self.paths)
+        return sys.stdout
 
     def __exit__(self, *exc):
         for stream in (sys.stdout, sys.stderr):
@@ -321,6 +348,47 @@ def _size(n):
     return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{n / 1e3:.0f} kB"
 
 
+def _data(target):
+    """The challenge's data: artifact/data/ in challenges split into artifact/ and method/, else data/."""
+    return target / ARTIFACT_DATA if (target / ARTIFACT_DATA).is_dir() else target / "data"
+
+
+def _functions(script):
+    """The names of the top-level functions of score.py, None if it cannot be parsed (running it shows why)."""
+    try:
+        tree = ast.parse(script.read_bytes())
+    except (SyntaxError, ValueError):
+        return None
+    return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _call_here(function, script, dataset, solution, target, here):
+    """Call function of score.py on dataset in this process, as the container's runner does. Returns its result dict."""
+    paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
+    sys.path[:0] = paths
+    os.environ["RAID_SOLUTION"] = str(solution)  # where score.py finds files that are not imported, e.g. solution.c
+    try:
+        with _Indented(here):  # score.py's own output, set off from the result
+            spec = importlib.util.spec_from_file_location("score", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            value = getattr(module, function)(dataset)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return {"error": "TypeError", "traceback": f"{function}() must return a number, not {value!r}"}
+        return {"value": float(value)}
+    except SystemExit as e:  # score.py stops with sys.exit("why"), e.g. when the solution does not compile
+        return {"exit": e.code if isinstance(e.code, str) else f"exit code {e.code}"}
+    except Exception as e:
+        return {"error": type(e).__name__, "traceback": _traceback(e, target)}
+    finally:
+        del os.environ["RAID_SOLUTION"]
+        for p in paths:
+            sys.path.remove(p)
+        for name, mod in list(sys.modules.items()):  # a later check sees the current solution
+            if target in Path(getattr(mod, "__file__", None) or "/").resolve().parents:
+                del sys.modules[name]
+
+
 def _check(challenge):
     if not isinstance(challenge, str) or not NAME_RE.match(challenge):
         raise RaidError(f"Invalid challenge name {challenge!r}.")
@@ -328,12 +396,14 @@ def _check(challenge):
 
 
 def _extract(archive, target, part):
-    """Extract only regular files and directories below part/, never outside target. source/ maps to target."""
+    """Extract only regular files and directories below part/, never outside target. source/ maps to target, the
+    data archive of a challenge split into artifact/ and method/ holds artifact/data/."""
     root = target.resolve()
+    allowed = [part, ARTIFACT_DATA.as_posix()] if part == "data" else [part]
     with tarfile.open(archive, "r:gz") as tar:
         for member in tar:
             name = posixpath.normpath(member.name)
-            if name != part and not name.startswith(part + "/"):
+            if not any(name == a or name.startswith(a + "/") for a in allowed) and not (part == "data" and name == "artifact"):
                 raise RaidError(f"Unexpected entry {member.name!r} in the {part} archive.")
             if part == "source":
                 name = name[len("source/"):] or "."
@@ -367,14 +437,16 @@ def _ignored(target):
 
 def _pack(target, archive, own=OWN):
     """tar.gz of the challenge directory without the top-level entries in own (by default data/, scoring/,
-    hidden/, reference/ and challenge.yaml) and the .raidignore patterns. Regular files only; caches,
-    VCS data and symlinks are left out."""
+    hidden/, reference/, challenge.yaml and entrypoint.sh, plus artifact/data/) and the .raidignore patterns.
+    Regular files only; caches, VCS data and symlinks are left out."""
+    nested = {ARTIFACT_DATA} if own is OWN else set()
     ignored = _ignored(target)
     with tarfile.open(archive, "w:gz") as tar:
         for dirpath, dirnames, filenames in os.walk(target):
             rel = Path(dirpath).relative_to(target)
             top = rel == Path(".")
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (top and d in own) and not ignored(rel / d))
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not (top and d in own) and rel / d not in nested
+                                 and not ignored(rel / d))
             files = sorted(f for f in filenames if f not in SKIP and not (top and f in own) and not ignored(rel / f))
             for name in dirnames + files:
                 path = Path(dirpath) / name
