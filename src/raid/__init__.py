@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
@@ -69,7 +69,7 @@ class Raid:
         """Score ./<challenge>/ locally: scoring/score.py's score() on data/. Returns the score.
 
         For challenge authors: hidden=True scores on hidden/, reference=True scores the files
-        in reference/ in place of the student files.
+        in reference/ in place of the student files. Raises RaidError when scoring stops without a score.
         """
         target = (self.path / _check(challenge)).resolve()
         script = target / "scoring" / "score.py"
@@ -78,14 +78,26 @@ class Raid:
         for path in (script, dataset, solution):
             if not path.exists():
                 raise RaidError(f"{path} not found." + (" Fetch the challenge first." if path == script else ""))
+        files = "reference/" if reference else "your files"
+        print(f"Checking {challenge}: {files} on {dataset.name}/")
+        here = str(Path.cwd().resolve()) + os.sep  # shown paths are relative, e.g. self-assessment/solution.c
         paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
         sys.path[:0] = paths
         os.environ["RAID_SOLUTION"] = str(solution)  # where score.py finds files that are not imported, e.g. solution.c
         try:
-            spec = importlib.util.spec_from_file_location("score", script)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            value = module.score(dataset)
+            with _Indented(here):  # score.py's own output, set off from the result
+                spec = importlib.util.spec_from_file_location("score", script)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                value = module.score(dataset)
+        except SystemExit as e:  # score.py stops with sys.exit("why"), e.g. when the solution does not compile
+            message = e.code if isinstance(e.code, str) else f"exit code {e.code}"
+            raise RaidError("No score, scoring stopped:\n" + _indent(message.strip(), here)) from None
+        except Exception as e:
+            raise RaidError(f"No score, scoring/score.py raised {type(e).__name__}:\n"
+                            + _indent(_traceback(e, target), here)
+                            + ("\nInstall the packages the challenge needs, see its setup.sh."
+                               if isinstance(e, ModuleNotFoundError) else "")) from e
         finally:
             del os.environ["RAID_SOLUTION"]
             for p in paths:
@@ -93,7 +105,7 @@ class Raid:
             for name, mod in list(sys.modules.items()):  # a later check sees the current solution
                 if target in Path(getattr(mod, "__file__", None) or "/").resolve().parents:
                     del sys.modules[name]
-        print(f"Score: {value}")
+        print(f"\n{_bold(f'Score: {value:.4f}')}")
         return value
 
     def submit(self, challenge):
@@ -209,6 +221,54 @@ def _status(text):
     if sys.stderr.isatty():
         sys.stderr.write(f"\r\033[K{text}")
         sys.stderr.flush()
+
+
+class _Indented:
+    """Indent everything printed to stdout and stderr inside the with block by two spaces; paths under here become relative."""
+
+    class _Stream:
+        def __init__(self, stream, here):
+            self.stream, self.here, self.line_start = stream, here, True
+
+        def write(self, text):
+            for line in text.splitlines(keepends=True):
+                if self.line_start and line.strip():
+                    self.stream.write("  ")
+                self.stream.write(line.replace(self.here, ""))
+                self.line_start = line.endswith(("\n", "\r"))
+            return len(text)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    def __init__(self, here=None):
+        self.here = here or "\0"
+
+    def __enter__(self):
+        self.saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = self._Stream(sys.stdout, self.here), self._Stream(sys.stderr, self.here)
+
+    def __exit__(self, *exc):
+        for stream in (sys.stdout, sys.stderr):
+            stream.flush()
+        sys.stdout, sys.stderr = self.saved
+
+
+def _indent(text, here):
+    return "\n".join("  " + line.replace(here, "") if line.strip() else line for line in text.splitlines())
+
+
+def _traceback(error, target):
+    """The traceback of an error in score.py, only with the frames of the challenge directory (score.py, solution)."""
+    import traceback
+    frames = [f for f in traceback.extract_tb(error.__traceback__)
+              if target in Path(f.filename).resolve().parents]
+    lines = traceback.format_list(frames) + traceback.format_exception_only(error)
+    return "".join(lines).rstrip()
+
+
+def _bold(text):
+    return f"\033[1m{text}\033[0m" if sys.stdout.isatty() and not os.environ.get("NO_COLOR") else text
 
 
 class _Progress:
