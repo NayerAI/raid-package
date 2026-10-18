@@ -139,7 +139,13 @@ class Container:
                **({"RAID_VERBOSE": "1"} if self.output else {}),
                **{k: v for k, v in os.environ.items() if PASSED_ENV.match(k)}}
         with tempfile.TemporaryDirectory() as tmp:
+            # Readable, and result.json writable, for whichever uid the container runs as: with rootless Docker or
+            # userns-remap the container's users are not the host's, so a 0700 directory of ours would be closed to it.
+            os.chmod(tmp, 0o755)
             shutil.copy(RUNNER, Path(tmp, "runner.py"))
+            Path(tmp, "runner.py").chmod(0o644)
+            Path(tmp, "result.json").touch()
+            Path(tmp, "result.json").chmod(0o666)
             argument = inside(argument) if isinstance(argument, Path) else argument
             command = ["python3", "-IS", "/raid-check/runner.py", function, argument, "/raid-check/result.json"]
             if self.kind == "docker":
@@ -153,6 +159,6 @@ class Container:
                 for line in iter(proc.stdout.readline, b""):
                     write(line.decode(errors="replace"))
             result = Path(tmp, "result.json")
-            if not result.is_file():
+            if not result.stat().st_size:
                 return {"exit": f"the container {self.name} exited with code {proc.returncode} before score.py finished"}
             return json.loads(result.read_text())
