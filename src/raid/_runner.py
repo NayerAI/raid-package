@@ -1,7 +1,8 @@
-"""Runs inside the raid-<challenge> container: python3 -IS _runner.py <function> <dataset> <result.json>
+"""Runs inside the raid-<challenge> container: python3 -IS _runner.py <function> <argument> <result.json>
 
-Calls <function> (score, method or artifact) of scoring/score.py in the working directory (the challenge directory)
-with the dataset path and writes {"value": ...}, {"exit": ...} or {"error": ..., "traceback": ...} to result.json.
+Calls <function> (create_scoring, score_method or score_artifact with the mode local or hidden, or an older
+challenge's score with the dataset path) of scoring/score.py in the working directory (the challenge directory)
+and writes {"value": ...}, {"exit": ...} or {"error": ..., "traceback": ...} to result.json.
 Like the backend, score.py sees only Debian's Python packages.
 """
 import importlib.util
@@ -14,7 +15,7 @@ from pathlib import Path
 DEBIAN_PACKAGES = "/usr/lib/python3/dist-packages"
 
 
-def main(function, dataset, out):
+def main(function, argument, out):
     job = Path.cwd()
     script = job / "scoring" / "score.py"
     solution = os.environ.get("RAID_SOLUTION", str(job))
@@ -25,7 +26,7 @@ def main(function, dataset, out):
         spec = importlib.util.spec_from_file_location("score", script)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        value = getattr(module, function)(Path(dataset))
+        value = getattr(module, function)(Path(argument) if function == "score" else argument)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             result = {"error": "TypeError", "traceback": f"{function}() must return a number, not {value!r}"}
         else:

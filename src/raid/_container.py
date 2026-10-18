@@ -1,9 +1,7 @@
-"""The local container raid-<challenge> in which task-check runs scoring/score.py, built like the backend's sandbox.
-
-With Docker it is an image on the backend's base (Debian trixie slim with python3), the challenge's Debian packages
-and the challenge's setup.sh, run as root during the build. With only udocker it is a udocker container of
-debian:trixie in which the same is installed. Either is built again only when setup.sh or the packages change: the
-image's label raid.setup (Docker) or the container's /etc/raid-setup.sha256 (udocker) holds their hash.
+"""The local container raid-<challenge> in which task-check runs scoring/score.py, built like the backend's sandbox:
+with Docker an image on the backend's base (Debian trixie slim with python3), with only udocker a udocker container of
+debian:trixie, in which the challenge's setup.sh runs as root. It is built again only when setup.sh changes: the
+image's label raid.setup (Docker) or the container's /etc/raid-setup.sha256 (udocker) holds its hash.
 """
 import hashlib
 import json
@@ -28,36 +26,6 @@ class ContainerError(Exception):
     pass
 
 
-def packages(target):
-    """The challenge's Debian packages: scoring/packages.txt (from the server) or, for challenge authors,
-    requirements in challenge.yaml."""
-    listed = target / "scoring" / "packages.txt"
-    if listed.is_file():
-        return listed.read_text().split()
-    meta = target / "challenge.yaml"
-    return _requirements(meta.read_text()) if meta.is_file() else []
-
-
-def _requirements(text):
-    """The requirements list of challenge.yaml, as a block (- gcc) or a flow sequence ([gcc, make])."""
-    lines = [line.split("#", 1)[0].rstrip() for line in text.splitlines()]
-    for i, line in enumerate(lines):
-        m = re.match(r"^requirements:\s*(.*)$", line)
-        if not m:
-            continue
-        if m.group(1).startswith("["):
-            flow = " ".join([m.group(1)] + lines[i + 1:])
-            return [p.strip().strip("'\"") for p in flow[1:flow.index("]")].split(",") if p.strip()]
-        found = []
-        for item in lines[i + 1:]:
-            if item and not item[0].isspace():
-                break
-            if item.strip().startswith("-"):
-                found.append(item.strip()[1:].strip().strip("'\""))
-        return found
-    return []
-
-
 def engine():
     """docker when it is installed and its daemon answers, else udocker when it is installed, else None."""
     if shutil.which("docker"):
@@ -73,20 +41,18 @@ class Container:
     def __init__(self, challenge, target, kind, output=None):
         """output: called with every line the build and score.py print (None: quiet, only errors)."""
         self.name, self.target, self.kind, self.output = f"raid-{challenge}", target, kind, output
-        self.packages = packages(target)
         setup = target / "setup.sh"
         self.setup = setup.read_bytes() if setup.is_file() else b""
         base = DOCKER_BASE if kind == "docker" else UDOCKER_BASE
-        self.hash = hashlib.sha256(f"{RECIPE}\0{base}\0{' '.join(self.packages)}\0".encode() + self.setup).hexdigest()
+        self.hash = hashlib.sha256(f"{RECIPE}\0{base}\0".encode() + self.setup).hexdigest()
 
     # ---------- building ----------
 
     def ensure(self, rebuild=False, status=print):
-        """Build the container unless it exists with the current setup.sh and packages."""
+        """Build the container unless it exists with the current setup.sh."""
         if not rebuild and self._built_hash() == self.hash:
             return
-        status(f"Building {self.name} with {'setup.sh' if self.setup.strip() else 'no setup.sh'}"
-               f"{' and ' + ' '.join(self.packages) if self.packages else ''} (once, and again when they change) ...")
+        status(f"Building {self.name} container with {'setup.sh' if self.setup.strip() else 'no setup.sh'} ...")
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "setup.sh").write_bytes(self.setup)
             if self.kind == "docker":
@@ -96,7 +62,7 @@ class Container:
 
     def _install(self):
         return ("apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-                f"python3 ca-certificates {' '.join(self.packages)}")
+                "python3 ca-certificates")
 
     def _built_hash(self):
         if self.kind == "docker":
@@ -139,7 +105,7 @@ class Container:
 
     def _step(self, cmd, setup=False):
         """Run a build command; on failure raise ContainerError with the end of its output. setup: the command
-        installs the packages and runs setup.sh."""
+        runs setup.sh."""
         lines = []
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL) as proc:
             for line in iter(proc.stdout.readline, b""):
@@ -157,8 +123,8 @@ class Container:
 
     # ---------- running ----------
 
-    def call(self, function, dataset, solution, write=None):
-        """Run function (score, method or artifact) of scoring/score.py on dataset in the container, with the
+    def call(self, function, argument, solution, write=None):
+        """Run function of scoring/score.py with argument (a mode, or a dataset path) in the container, with the
         challenge directory at /job. Output goes to write line by line; score.py prints the output of everything it
         runs unless the container is quiet. Returns the runner's result dict."""
         write = write or sys.stdout.write
@@ -168,7 +134,8 @@ class Container:
                **{k: v for k, v in os.environ.items() if PASSED_ENV.match(k)}}
         with tempfile.TemporaryDirectory() as tmp:
             shutil.copy(RUNNER, Path(tmp, "runner.py"))
-            command = ["python3", "-IS", "/raid-check/runner.py", function, inside(dataset), "/raid-check/result.json"]
+            argument = inside(argument) if isinstance(argument, Path) else argument
+            command = ["python3", "-IS", "/raid-check/runner.py", function, argument, "/raid-check/result.json"]
             if self.kind == "docker":
                 user = ["--user", f"{os.getuid()}:{os.getgid()}"] if hasattr(os, "getuid") else []
                 cmd = ["docker", "run", "--rm", "--init", *user, "-v", f"{self.target}:/job", "-v", f"{tmp}:/raid-check",

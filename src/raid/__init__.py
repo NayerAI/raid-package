@@ -23,7 +23,9 @@ PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge 
 # Parts of the challenge directory that are never submitted: these top-level entries and artifact/data/
 OWN = {"data", "scoring", "hidden", "reference", "challenge.yaml", "entrypoint.sh"}
 ARTIFACT_DATA = Path("artifact", "data")  # the data/ part of challenges split into artifact/ and method/
-CHECKS = {"method": "Verification score", "artifact": "Artifact score", None: "Score"}  # the part checked: what it prints
+# The part checked: score.py's function and what it prints. Older challenges define only score(path).
+CHECKS = {"method": ("score_method", "Verification score"), "artifact": ("score_artifact", "Artifact score"),
+          None: ("create_scoring", "Score")}
 SKIP = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", "venv", ".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -72,8 +74,8 @@ class Raid:
     def check(self, challenge, part=None, hidden=False, reference=False, container=True, rebuild=False, quiet=False):
         """Check ./<challenge>/ locally with scoring/score.py on its data (artifact/data/ or data/). Returns the score.
 
-        part="method" calls score.py's method() (the verification score), part="artifact" its artifact() (the
-        artifact score) and part=None its score(), which checks the method first and then the artifact. It runs in the container raid-<challenge>, built like the
+        part="method" calls score.py's score_method() (the verification score), part="artifact" its score_artifact()
+        (the artifact score) and part=None its create_scoring(), which runs both, with the mode "local" (or "hidden"). It runs in the container raid-<challenge>, built like the
         backend's sandbox with the challenge's setup.sh (Docker, else udocker) and rebuilt when setup.sh changes or
         rebuild=True; container=False runs it on this machine instead. The output of the build and of everything
         score.py runs (method/run, make, tests) is shown unless quiet=True; score.py reads $RAID_VERBOSE for it.
@@ -90,11 +92,14 @@ class Raid:
         for path in (script, dataset, solution):
             if not path.exists():
                 raise RaidError(f"{path} not found." + (" Fetch the challenge first." if path == script else ""))
-        function = part or "score"
+        function, label = CHECKS[part]
+        argument = "hidden" if hidden else "local"  # the mode of create_scoring(), score_method(), score_artifact()
         defined = _functions(script)
-        if part and defined is not None and part not in defined:
-            raise RaidError(f"{challenge} has no separate {part} check (scoring/score.py has no {part}()). "
-                            f"Run task check {challenge}.")
+        if defined is not None and "create_scoring" not in defined and "score" in defined:  # older challenges
+            function, argument = "score", dataset
+        if defined is not None and function not in defined:
+            raise RaidError(f"{challenge} has no separate {part} check (scoring/score.py has no {CHECKS[part][0]}()). "
+                            f"Run task check {challenge}." if part else f"scoring/score.py has no {function}().")
         files = "reference/" if reference else "your files"
         what = f"{challenge} {part}" if part else challenge
         here = str(Path.cwd().resolve()) + os.sep  # shown paths are relative, e.g. self-assessment/solution.c
@@ -114,13 +119,13 @@ class Raid:
                 raise RaidError(str(e)) from None
             inside = (str(target) + os.sep).replace(here, "")  # /job/ in the container is the challenge directory
             with _Indented(here, {"/job/": inside}) as out:
-                result = box.call(function, dataset, solution, out.write)
+                result = box.call(function, argument, solution, out.write)
             for key in ("traceback", "exit"):  # paths in the container
                 if isinstance(result.get(key), str):
                     result[key] = result[key].replace("/job/", inside)
         else:
             print(f"Checking {what}: {files} on {shown}")
-            result = _call_here(function, script, dataset, solution, target, here, quiet)
+            result = _call_here(function, script, argument, solution, target, here, quiet)
         if "exit" in result:
             raise RaidError("No score, scoring stopped:\n" + _indent(str(result["exit"]).strip(), here))
         if "error" in result:
@@ -128,7 +133,7 @@ class Raid:
                             + ("\nInstall the packages the challenge needs, see its setup.sh."
                                if result["error"] == "ModuleNotFoundError" and not container else ""))
         value = result["value"]
-        print(f"\n{_bold(f'{CHECKS[part]}: {value:.4f}')}")
+        print(f"\n{_bold(f'{label}: {value:.4f}')}")
         return value
 
     def submit(self, challenge):
@@ -371,8 +376,9 @@ def _functions(script):
     return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
-def _call_here(function, script, dataset, solution, target, here, quiet=False):
-    """Call function of score.py on dataset in this process, as the container's runner does. Returns its result dict."""
+def _call_here(function, script, argument, solution, target, here, quiet=False):
+    """Call function of score.py with argument (the mode, or the dataset of an older score()) in this process, as the
+    container's runner does. Returns its result dict."""
     paths = [str(script.parent), str(solution)]  # score.py imports the solution, e.g. `from solution import md5`
     sys.path[:0] = paths
     os.environ["RAID_SOLUTION"] = str(solution)  # where score.py finds files that are not imported, e.g. solution.c
@@ -383,7 +389,7 @@ def _call_here(function, script, dataset, solution, target, here, quiet=False):
             spec = importlib.util.spec_from_file_location("score", script)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            value = getattr(module, function)(dataset)
+            value = getattr(module, function)(argument)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return {"error": "TypeError", "traceback": f"{function}() must return a number, not {value!r}"}
         return {"value": float(value)}
