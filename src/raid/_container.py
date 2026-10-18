@@ -26,6 +26,12 @@ class ContainerError(Exception):
     pass
 
 
+def rootless():
+    """Whether the docker daemon is rootless (Docker or Podman): its root is the user, so no --user is needed."""
+    info = subprocess.run(["docker", "info"], capture_output=True, text=True).stdout
+    return bool(re.search(r"^\s*rootless(: true)?\s*$", info, re.M | re.I))
+
+
 def engine():
     """docker when it is installed and its daemon answers, else udocker when it is installed, else None."""
     if shutil.which("docker"):
@@ -137,7 +143,7 @@ class Container:
             argument = inside(argument) if isinstance(argument, Path) else argument
             command = ["python3", "-IS", "/raid-check/runner.py", function, argument, "/raid-check/result.json"]
             if self.kind == "docker":
-                user = ["--user", f"{os.getuid()}:{os.getgid()}"] if hasattr(os, "getuid") else []
+                user = ["--user", f"{os.getuid()}:{os.getgid()}"] if hasattr(os, "getuid") and not rootless() else []
                 cmd = ["docker", "run", "--rm", "--init", *user, "-v", f"{self.target}:/job", "-v", f"{tmp}:/raid-check",
                        "-w", "/job", *[f"--env={k}={v}" for k, v in env.items()], self.name, *command]
             else:
