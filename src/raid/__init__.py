@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["Raid", "RaidError"]
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 DEFAULT_URL = "https://raid.mlsec.tu-berlin.de"
 PARTS = ("source", "data", "scoring")  # source/ is unpacked into the challenge directory itself
